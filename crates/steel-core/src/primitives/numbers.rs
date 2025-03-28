@@ -922,16 +922,46 @@ fn denominator(number: &SteelVal) -> Result<SteelVal> {
 #[steel_derive::function(name = "expt", constant = true)]
 fn expt(left: &SteelVal, right: &SteelVal) -> Result<SteelVal> {
     match (left, right) {
-        (SteelVal::IntV(l), SteelVal::IntV(r)) => match u32::try_from(*r) {
-            Ok(r) => l.pow(r).into_steelval(),
-            Err(_) => (*l as f64).powf(*r as f64).into_steelval(),
-        },
+        (SteelVal::IntV(l), SteelVal::IntV(r)) if *r >= 0 => {
+            match u32::try_from(*r).ok().and_then(|r| l.checked_pow(r)) {
+                Some(val) => val.into_steelval(),
+                None => BigInt::from(*l).pow(*r as usize).into_steelval(),
+            }
+        }
+        // r is negative here
+        (SteelVal::IntV(l), SteelVal::IntV(r)) => {
+            if l.is_zero() {
+                stop!(Generic => "expt: 0 cannot be raised to a negative power");
+            }
+
+            let r = r.unsigned_abs();
+            // a^-b = 1/(a^b)
+            match (u32::try_from(r).ok())
+                .and_then(|r| l.checked_pow(r))
+                .and_then(|l| i32::try_from(l).ok())
+            {
+                Some(val) => Rational32::new_raw(1, val).into_steelval(),
+                None => {
+                    BigRational::new_raw(BigInt::from(1), BigInt::from(*l).pow(r)).into_steelval()
+                }
+            }
+        }
         (SteelVal::IntV(l), SteelVal::NumV(r)) => (*l as f64).powf(*r).into_steelval(),
         (SteelVal::IntV(l), SteelVal::Rational(r)) => {
             (*l as f64).powf(r.to_f64().unwrap()).into_steelval()
         }
         (SteelVal::IntV(l), SteelVal::BigNum(r)) => {
-            (*l as f64).powf(r.to_f64().unwrap()).into_steelval()
+            if l.is_zero() {
+                stop!(Generic => "expt: 0 cannot be raised to a negative power");
+            }
+
+            let expt = BigInt::from(*l).pow(r.magnitude());
+            match r.sign() {
+                num::bigint::Sign::Plus | num::bigint::Sign::NoSign => expt.into_steelval(),
+                num::bigint::Sign::Minus => {
+                    BigRational::new_raw(BigInt::from(1), expt).into_steelval()
+                }
+            }
         }
         (SteelVal::IntV(l), SteelVal::BigRational(r)) => {
             (*l as f64).powf(r.to_f64().unwrap()).into_steelval()
@@ -970,21 +1000,21 @@ fn expt(left: &SteelVal, right: &SteelVal) -> Result<SteelVal> {
             .unwrap()
             .powf(r.to_f64().unwrap())
             .into_steelval(),
-        (SteelVal::BigNum(l), SteelVal::BigNum(r)) => match r.as_ref().sign() {
-            num::bigint::Sign::NoSign | num::bigint::Sign::Plus => l
-                .as_ref()
-                .clone()
-                .pow(r.as_ref().magnitude())
-                .into_steelval(),
-            num::bigint::Sign::Minus => Ok(SteelVal::NumV(
-                l.to_f64().unwrap().powf(r.to_f64().unwrap()),
-            )),
-        },
+        (SteelVal::BigNum(l), SteelVal::BigNum(r)) => {
+            let expt = l.as_ref().clone().pow(r.magnitude());
+            match r.sign() {
+                num::bigint::Sign::NoSign | num::bigint::Sign::Plus => expt.into_steelval(),
+                num::bigint::Sign::Minus => {
+                    BigRational::new_raw(BigInt::from(1), expt).into_steelval()
+                }
+            }
+        }
         (SteelVal::BigNum(l), SteelVal::IntV(r)) => match *r {
             0 => 1.into_steelval(),
-            r if r < 0 => Ok(SteelVal::NumV(
-                l.to_f64().unwrap().powf(r.to_f64().unwrap()),
-            )),
+            r if r < 0 => {
+                BigRational::new_raw(BigInt::from(1), l.as_ref().clone().pow(r.unsigned_abs()))
+                    .into_steelval()
+            }
             r => l.as_ref().clone().pow(r as usize).into_steelval(),
         },
         (SteelVal::BigNum(l), SteelVal::NumV(r)) => l.to_f64().unwrap().powf(*r).into_steelval(),
@@ -1239,6 +1269,50 @@ fn sqrt(number: &SteelVal) -> Result<SteelVal> {
     }
 }
 
+/// Returns the real part of a number
+///
+/// (real-part number) -> number?
+///
+/// # Examples
+/// ```scheme
+/// > (real-part 3+4i) ;; => 3
+/// > (real-part 42) ;; => 42
+/// ```
+#[steel_derive::function(name = "real-part", constant = true)]
+pub fn real_part(value: &SteelVal) -> Result<SteelVal> {
+    match value {
+        val @ SteelVal::IntV(_)
+        | val @ SteelVal::BigNum(_)
+        | val @ SteelVal::Rational(_)
+        | val @ SteelVal::BigRational(_)
+        | val @ SteelVal::NumV(_) => Ok(val.clone()),
+        SteelVal::Complex(complex) => Ok(complex.re.clone()),
+        _ => steelerr!(TypeMismatch => "real-part expected number"),
+    }
+}
+
+/// Returns the imaginary part of a number
+///
+/// (imag-part number) -> number?
+///
+/// # Examples
+/// ```scheme
+/// > (imag-part 3+4i) ;; => 4
+/// > (imag-part 42) ;; => 0
+/// ```
+#[steel_derive::function(name = "imag-part", constant = true)]
+pub fn imag_part(value: &SteelVal) -> Result<SteelVal> {
+    match value {
+        SteelVal::IntV(_)
+        | SteelVal::BigNum(_)
+        | SteelVal::Rational(_)
+        | SteelVal::BigRational(_)
+        | SteelVal::NumV(_) => Ok(SteelVal::IntV(0)),
+        SteelVal::Complex(complex) => Ok(complex.im.clone()),
+        _ => steelerr!(TypeMismatch => "imag-part expected number"),
+    }
+}
+
 /// Computes the magnitude of the given number.
 ///
 /// (magnitude number) -> number?
@@ -1346,6 +1420,112 @@ where
     let x_sq = x.clone() * x.clone();
     let rem = target.clone() - x_sq;
     (x, rem)
+}
+
+/// Performs a bitwise arithmetic shift using the given 2 numbers
+///
+/// (arithmetic-shift n m) -> integer?
+///
+/// * n : integer? - The number to shift.
+/// * m : integer? - The number by which to shift.
+///
+/// # Examples
+/// ```scheme
+/// > (arithmetic-shift 10 1) ;; => 20
+/// > (arithmetic-shift 20 1) ;; => 40
+/// > (arithmetic-shift 40 -2) ;; => 10
+/// ```
+#[steel_derive::native(name = "arithmetic-shift", constant = true, arity = "Exact(2)")]
+pub fn arithmetic_shift(args: &[SteelVal]) -> Result<SteelVal> {
+    match &args {
+        [n, m] => match (n, m) {
+            (SteelVal::IntV(n), SteelVal::IntV(m)) => {
+                if *m >= 0 {
+                    Ok(SteelVal::IntV(n << m))
+                } else {
+                    Ok(SteelVal::IntV(n >> -m))
+                }
+            }
+            _ => stop!(TypeMismatch => "arithmetic-shift expected 2 integers"),
+        },
+        _ => stop!(ArityMismatch => "arithmetic-shift takes 2 arguments"),
+    }
+}
+
+/// Checks if the given number is even
+///
+/// (even? n) -> bool?
+///
+/// * n : number? - The number to check for evenness.
+///
+/// # Examples
+/// ```scheme
+/// > (even? 2) ;; => #true
+/// > (even? 3) ;; => #false
+/// > (even? 4.0) ;; => #true
+/// ```
+#[steel_derive::function(name = "even?", constant = true)]
+pub fn even(arg: &SteelVal) -> Result<SteelVal> {
+    match arg {
+        SteelVal::IntV(n) => Ok(SteelVal::BoolV(n & 1 == 0)),
+        SteelVal::BigNum(n) => Ok(SteelVal::BoolV(n.is_even())),
+        SteelVal::NumV(n) if n.fract() == 0.0 => (*n as i64).is_even().into_steelval(),
+        _ => steelerr!(TypeMismatch => "even? requires an integer, found: {:?}", arg),
+    }
+}
+
+/// Checks if the given number is odd
+///
+/// (odd? n) -> bool?
+///
+/// * n : number? - The number to check for oddness.
+///
+/// # Examples
+/// ```scheme
+/// > (odd? 2) ;; => #false
+/// > (odd? 3) ;; => #true
+/// > (odd? 5.0) ;; => #true
+/// ```
+#[steel_derive::function(name = "odd?", constant = true)]
+pub fn odd(arg: &SteelVal) -> Result<SteelVal> {
+    match arg {
+        SteelVal::IntV(n) => Ok(SteelVal::BoolV(n & 1 == 1)),
+        SteelVal::BigNum(n) => Ok(SteelVal::BoolV(n.is_odd())),
+        SteelVal::NumV(n) if n.fract() == 0.0 => (*n as i64).is_odd().into_steelval(),
+        _ => {
+            steelerr!(TypeMismatch => "odd? requires an integer, found: {:?}", arg)
+        }
+    }
+}
+
+/// Sums all given floats
+///
+/// (f+ nums) -> number?
+///
+/// * nums : float? - The floats to sum up.
+///
+/// # Examples
+/// ```scheme
+/// > (f+ 5.5) ;; => 5.5
+/// > (f+ 1.1 2.2) ;; => 3.3
+/// > (f+ 3.3 3.3 3.3) ;; => 9.9
+/// ```
+#[steel_derive::native(name = "f+", constant = true, arity = "AtLeast(1)")]
+pub fn float_add(args: &[SteelVal]) -> Result<SteelVal> {
+    if args.is_empty() {
+        stop!(ArityMismatch => "f+ requires at least one argument")
+    }
+    let mut sum = 0.0;
+
+    for arg in args {
+        if let SteelVal::NumV(n) = arg {
+            sum += n;
+        } else {
+            stop!(TypeMismatch => "f+ expected a float, found {:?}", arg);
+        }
+    }
+
+    Ok(SteelVal::NumV(sum))
 }
 
 fn ensure_args_are_numbers(op: &str, args: &[SteelVal]) -> Result<()> {
@@ -1617,84 +1797,6 @@ fn negate_complex(x: &SteelComplex) -> Result<SteelVal> {
 fn add_complex(x: &SteelComplex, y: &SteelComplex) -> Result<SteelVal> {
     // TODO: Optimize the implementation if needed.
     SteelComplex::new(add_two(&x.re, &y.re)?, add_two(&x.im, &y.im)?).into_steelval()
-}
-
-pub struct NumOperations {}
-impl NumOperations {
-    pub fn arithmetic_shift() -> SteelVal {
-        SteelVal::FuncV(|args: &[SteelVal]| -> Result<SteelVal> {
-            if args.len() != 2 {
-                stop!(ArityMismatch => "arithmetic-shift takes 2 arguments")
-            }
-            let n = args[0].clone();
-            let m = args[1].clone();
-
-            match (n, m) {
-                (SteelVal::IntV(n), SteelVal::IntV(m)) => {
-                    if m >= 0 {
-                        Ok(SteelVal::IntV(n << m))
-                    } else {
-                        Ok(SteelVal::IntV(n >> -m))
-                    }
-                }
-                _ => steelerr!(TypeMismatch => "arithmetic-shift expected 2 integers"),
-            }
-        })
-    }
-
-    pub fn even() -> SteelVal {
-        SteelVal::FuncV(|args: &[SteelVal]| -> Result<SteelVal> {
-            if args.len() != 1 {
-                stop!(ArityMismatch => "even? takes one argument")
-            }
-
-            match &args[0] {
-                SteelVal::IntV(n) => Ok(SteelVal::BoolV(n & 1 == 0)),
-                SteelVal::BigNum(n) => Ok(SteelVal::BoolV(n.is_even())),
-                SteelVal::NumV(n) if n.fract() == 0.0 => (*n as i64).is_even().into_steelval(),
-                _ => {
-                    steelerr!(TypeMismatch => format!("even? requires an integer, found: {:?}", &args[0]))
-                }
-            }
-        })
-    }
-
-    pub fn odd() -> SteelVal {
-        SteelVal::FuncV(|args: &[SteelVal]| -> Result<SteelVal> {
-            if args.len() != 1 {
-                stop!(ArityMismatch => "odd? takes one argument")
-            }
-
-            match &args[0] {
-                SteelVal::IntV(n) => Ok(SteelVal::BoolV(n & 1 == 1)),
-                SteelVal::BigNum(n) => Ok(SteelVal::BoolV(n.is_odd())),
-                SteelVal::NumV(n) if n.fract() == 0.0 => (*n as i64).is_odd().into_steelval(),
-                _ => {
-                    steelerr!(TypeMismatch => format!("odd? requires an integer, found: {:?}", &args[0]))
-                }
-            }
-        })
-    }
-
-    pub fn float_add() -> SteelVal {
-        SteelVal::FuncV(|args: &[SteelVal]| -> Result<SteelVal> {
-            if args.is_empty() {
-                stop!(ArityMismatch => "+ requires at least one argument")
-            }
-
-            let mut sum = 0.0;
-
-            for arg in args {
-                if let SteelVal::NumV(n) = arg {
-                    sum += n;
-                } else {
-                    stop!(TypeMismatch => "+ expected a number, found {:?}", arg);
-                }
-            }
-
-            Ok(SteelVal::NumV(sum))
-        })
-    }
 }
 
 #[cfg(test)]
