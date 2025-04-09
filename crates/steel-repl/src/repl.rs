@@ -1,10 +1,14 @@
 extern crate rustyline;
 use colored::*;
 use rustyline::history::FileHistory;
+use rustyline::{
+    Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyEvent, RepeatCount,
+};
 use steel::compiler::modules::steel_home;
 use steel::rvals::{Custom, SteelString};
 
 use std::error::Error;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 
@@ -182,6 +186,33 @@ pub fn readline_module(vm: &mut Engine) {
     vm.register_module(module);
 }
 
+struct CtrlCHandler {
+    close_on_interrupt: Arc<AtomicBool>,
+    empty_line_cancelled: AtomicBool,
+}
+
+impl CtrlCHandler {
+    fn new(close_on_interrupt: Arc<AtomicBool>) -> Self {
+        CtrlCHandler {
+            close_on_interrupt,
+            empty_line_cancelled: AtomicBool::new(false),
+        }
+    }
+}
+
+impl ConditionalEventHandler for CtrlCHandler {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, ctx: &EventContext) -> Option<Cmd> {
+        if !ctx.line().is_empty() {
+            // if the line is not empty, reset the PREVIOUS_LINE_CANCELLED state
+            self.empty_line_cancelled.store(false, Ordering::Release);
+        } else if self.empty_line_cancelled.swap(true, Ordering::Release) {
+            self.close_on_interrupt.store(true, Ordering::Release);
+        }
+
+        Some(Cmd::Interrupt)
+    }
+}
+
 /// Entry point for the repl
 /// Automatically adds the prelude and contracts for the core library
 pub fn repl_base(mut vm: Engine) -> std::io::Result<()> {
@@ -235,6 +266,10 @@ pub fn repl_base(mut vm: Engine) -> std::io::Result<()> {
     let clear_interrupted = move || {
         safepoint.resume();
     };
+
+    let close_on_interrupt = Arc::new(AtomicBool::new(false));
+    let ctrlc = Box::new(CtrlCHandler::new(close_on_interrupt.clone()));
+    rl.bind_sequence(KeyEvent::ctrl('c'), EventHandler::Conditional(ctrlc));
 
     while rx.try_recv().is_err() {
         // Update globals for highlighting
@@ -313,8 +348,12 @@ pub fn repl_base(mut vm: Engine) -> std::io::Result<()> {
                 }
             }
             Err(ReadlineError::Interrupted) => {
-                println!("CTRL-C");
-                continue;
+                if close_on_interrupt.load(Ordering::Acquire) {
+                    break;
+                } else {
+                    println!("CTRL-C");
+                    continue;
+                }
             }
             Err(ReadlineError::Eof) => {
                 println!("CTRL-D");
